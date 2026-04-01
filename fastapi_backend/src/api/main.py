@@ -9,6 +9,12 @@ Authentication:
 - Use /auth/register and /auth/login to obtain a JWT access token.
 - Send "Authorization: Bearer <token>" header for REST requests.
 - For WebSocket, pass token as query param: /ws?token=<token>
+
+Realtime:
+- WebSocket is hosted at `/ws` (same host/port as REST).
+- Next.js client should set:
+  - NEXT_PUBLIC_API_BASE_URL: e.g. "https://<backend-host>:<port>"
+  - NEXT_PUBLIC_WS_BASE_URL: e.g. "wss://<backend-host>:<port>"
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from src.api.routers.moderation import router as moderation_router
 from src.api.routers.notifications import router as notifications_router
 from src.api.routers.rsvps import router as rsvps_router
 from src.auth.security import decode_token
+from src.core.settings import get_settings
 from src.db.base import Base
 from src.db.models import Notification, NotificationType, Thread, User
 from src.db.session import get_engine, session_scope
@@ -52,9 +59,15 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
+settings = get_settings()
+
+# CORS:
+# - In preview, the Next.js frontend is typically served from a different origin/port.
+# - Configure allowed origins via CORS_ALLOW_ORIGINS (comma-separated) for a tighter policy.
+# - Default "*" keeps local/dev friction low.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -64,12 +77,17 @@ manager = ConnectionManager()
 
 
 @app.on_event("startup")
-def _startup_create_tables() -> None:
+def _startup_prepare_schema() -> None:
     """
-    Create tables for development environments.
+    Prepare database schema on startup.
 
-    In a production system you would use migrations (Alembic). For this codegen step,
-    we ensure the schema exists so the API can run in CI/dev.
+    Current behavior:
+    - Calls SQLAlchemy `Base.metadata.create_all()` to ensure tables exist in preview/dev.
+
+    Migration workflow alignment:
+    - The Postgres container has a canonical migration entrypoint (`postgresql_database/migrate.sh`).
+      This backend does not run that script directly; instead it assumes the DB container
+      has applied migrations (or uses create_all for this minimal stack).
     """
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
@@ -141,7 +159,9 @@ async def websocket_endpoint(websocket: WebSocket):
     """
     WebSocket endpoint for realtime messaging & notifications.
 
-    Connect: ws://<host>/ws?token=<JWT>
+    Connect:
+      ws(s)://<host>/ws?token=<JWT>
+
     Client messages:
       - {"type":"ping"}
       - {"type":"message_send","thread_id":123,"body":"Hello"}
@@ -171,14 +191,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 thread_id = data.get("thread_id")
                 body = (data.get("body") or "").strip()
                 if not isinstance(thread_id, int) or not body:
-                    await websocket.send_json({"type": "error", "message": "Invalid message_send payload"})
+                    await websocket.send_json(
+                        {"type": "error", "message": "Invalid message_send payload"}
+                    )
                     continue
 
                 # Validate thread participant and persist the message; then broadcast to both participants.
                 with session_scope() as db:
                     thread = db.get(Thread, thread_id)
                     if not thread or user.id not in (thread.user_a_id, thread.user_b_id):
-                        await websocket.send_json({"type": "error", "message": "Thread not found or access denied"})
+                        await websocket.send_json(
+                            {"type": "error", "message": "Thread not found or access denied"}
+                        )
                         continue
 
                     from src.db.models import Message  # local import to avoid circulars
@@ -200,7 +224,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     }
 
                     # Create a notification for the other user.
-                    other_user_id = thread.user_b_id if user.id == thread.user_a_id else thread.user_a_id
+                    other_user_id = (
+                        thread.user_b_id if user.id == thread.user_a_id else thread.user_a_id
+                    )
                     n = Notification(
                         user_id=other_user_id,
                         type=NotificationType.message,

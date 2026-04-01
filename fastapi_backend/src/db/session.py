@@ -2,21 +2,27 @@
 Database session/engine setup for the FastAPI backend.
 
 Uses environment variables provided by the database container:
-- POSTGRES_URL
+- POSTGRES_URL (optional, full SQLAlchemy URL)
 - POSTGRES_USER
 - POSTGRES_PASSWORD
 - POSTGRES_DB
 - POSTGRES_PORT
+- POSTGRES_HOST (optional; defaults to "localhost")
+
+Integration note:
+- The bundled `postgresql_database` container listens on port 5000 by default, so this
+  backend defaults POSTGRES_PORT to 5000 (via Settings) unless overridden.
 """
 
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 from typing import Generator
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+
+from src.core.settings import get_settings
 
 _ENGINE = None
 _SessionLocal = None
@@ -26,29 +32,40 @@ def _build_postgres_url() -> str:
     """
     Build SQLAlchemy database URL from environment variables.
 
-    We intentionally do not assume POSTGRES_URL format; if POSTGRES_URL is set,
-    we use it directly as the SQLAlchemy URL. Otherwise we assemble a standard
-    postgres URL from component env vars.
+    Contract:
+    - If POSTGRES_URL is set, it is used as-is (must be a valid SQLAlchemy URL).
+      Examples:
+        postgresql+psycopg2://user:pass@host:5000/myapp
+        postgresql://user:pass@host:5000/myapp
+    - Otherwise, POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB must be set and the URL
+      is assembled from components.
     """
-    direct = os.getenv("POSTGRES_URL")
-    if direct:
-        return direct
+    s = get_settings()
 
-    user = os.getenv("POSTGRES_USER")
-    password = os.getenv("POSTGRES_PASSWORD")
-    db = os.getenv("POSTGRES_DB")
-    port = os.getenv("POSTGRES_PORT", "5432")
-    host = os.getenv("POSTGRES_HOST", "localhost")  # optional; may not be present
+    if s.postgres_url:
+        return s.postgres_url
 
-    if not all([user, password, db]):
-        missing = [k for k in ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"] if not os.getenv(k)]
+    if not all([s.postgres_user, s.postgres_password, s.postgres_db]):
+        missing = [
+            k
+            for k, v in [
+                ("POSTGRES_USER", s.postgres_user),
+                ("POSTGRES_PASSWORD", s.postgres_password),
+                ("POSTGRES_DB", s.postgres_db),
+            ]
+            if not v
+        ]
         raise RuntimeError(
             "Database env vars missing: "
             + ", ".join(missing)
             + ". Provide POSTGRES_URL or the component vars."
         )
 
-    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
+    return (
+        "postgresql+psycopg2://"
+        f"{s.postgres_user}:{s.postgres_password}"
+        f"@{s.postgres_host}:{s.postgres_port}/{s.postgres_db}"
+    )
 
 
 def get_engine():
@@ -57,7 +74,9 @@ def get_engine():
     if _ENGINE is None:
         db_url = _build_postgres_url()
         _ENGINE = create_engine(db_url, pool_pre_ping=True, future=True)
-        _SessionLocal = sessionmaker(bind=_ENGINE, autocommit=False, autoflush=False, future=True)
+        _SessionLocal = sessionmaker(
+            bind=_ENGINE, autocommit=False, autoflush=False, future=True
+        )
     return _ENGINE
 
 
